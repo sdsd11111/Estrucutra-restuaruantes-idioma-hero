@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
+import { headers } from 'next/headers';
 import { z } from 'zod';
 import { serialize } from 'cookie';
+import { loginLimiter, getIPKey, getUsernameIPkey } from '@/lib/rateLimiter';
 
 // Credenciales válidas
 const VALID_CREDENTIALS = {
@@ -15,7 +16,18 @@ const loginSchema = z.object({
   password: z.string().min(1, 'La contraseña es requerida'),
 });
 
+// Función para obtener la IP del cliente
+const getClientIP = (request: Request) => {
+  const forwardedFor = request.headers.get('x-forwarded-for');
+  const ip = forwardedFor ? forwardedFor.split(',')[0].trim() : '127.0.0.1';
+  return ip;
+};
+
 export async function POST(request: Request) {
+  const ip = getClientIP(request);
+  const ipKey = getIPKey(ip);
+  let usernameIPkey: string | null = null;
+
   try {
     const body = await request.json();
     
@@ -30,13 +42,68 @@ export async function POST(request: Request) {
     }
     
     const { username, password } = result.data;
+    usernameIPkey = getUsernameIPkey(username, ip);
+    
+    // Verificar límites de intentos por IP
+    const [resUsernameAndIP, resSlowByIP] = await Promise.all([
+      loginLimiter.limiterConsecutiveFailsByUsernameAndIP.get(usernameIPkey),
+      loginLimiter.limiterSlowBruteByIP.get(ipKey),
+    ]);
+
+    let retrySecs = 0;
+    
+    // Verificar si la IP está bloqueada
+    if (resSlowByIP !== null && resSlowByIP.consumedPoints > loginLimiter.maxConsecutiveFailsByUsernameAndIP) {
+      retrySecs = Math.round(resSlowByIP.msBeforeNext / 1000) || 1;
+    } else if (resUsernameAndIP !== null && resUsernameAndIP.consumedPoints > loginLimiter.maxConsecutiveFailsByUsernameAndIP) {
+      retrySecs = Math.round(resUsernameAndIP.msBeforeNext / 1000) || 1;
+    }
+
+    if (retrySecs > 0) {
+      // Usuario bloqueado temporalmente
+      return NextResponse.json(
+        { 
+          message: `Demasiados intentos fallidos. Por favor, intente de nuevo en ${Math.ceil(retrySecs / 60)} minutos.`,
+          retryAfter: retrySecs 
+        },
+        { 
+          status: 429,
+          headers: {
+            'Retry-After': retrySecs.toString()
+          }
+        }
+      );
+    }
     
     // Verificar las credenciales
     if (username !== VALID_CREDENTIALS.username || password !== VALID_CREDENTIALS.password) {
+      try {
+        // Incrementar contador de intentos fallidos
+        await Promise.all([
+          loginLimiter.limiterSlowBruteByIP.consume(ipKey),
+          loginLimiter.limiterConsecutiveFailsByUsernameAndIP.consume(usernameIPkey)
+        ]);
+      } catch (rlRejected) {
+        if (rlRejected instanceof Error) {
+          console.error('Error al incrementar contador de intentos fallidos:', rlRejected);
+        }
+      }
+      
+      const remainingAttempts = loginLimiter.maxConsecutiveFailsByUsernameAndIP - 
+        ((resUsernameAndIP?.consumedPoints || 0) + 1);
+      
       return NextResponse.json(
-        { message: 'Credenciales inválidas' },
+        { 
+          message: `Credenciales inválidas. ${remainingAttempts > 0 ? `Intentos restantes: ${remainingAttempts}` : 'Cuenta bloqueada temporalmente.'}`,
+          remainingAttempts: remainingAttempts
+        },
         { status: 401 }
       );
+    }
+    
+    // Si el inicio de sesión es exitoso, limpiar los contadores de intentos fallidos
+    if (usernameIPkey) {
+      await loginLimiter.limiterConsecutiveFailsByUsernameAndIP.delete(usernameIPkey);
     }
     
     // Crear una cookie de sesión segura
@@ -49,7 +116,10 @@ export async function POST(request: Request) {
     });
     
     const response = NextResponse.json(
-      { message: 'Inicio de sesión exitoso' },
+      { 
+        message: 'Inicio de sesión exitoso',
+        remainingAttempts: loginLimiter.maxConsecutiveFailsByUsernameAndIP
+      },
       { status: 200 }
     );
     
